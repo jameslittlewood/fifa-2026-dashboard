@@ -1,5 +1,6 @@
 from pathlib import Path
 from html import escape
+import logging
 import unicodedata
 
 import pandas as pd
@@ -7,6 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+LOGGER = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="World Cup 2026 Scenario Explorer",
@@ -848,6 +850,31 @@ def inject_theme_css(active_theme: dict[str, str]) -> None:
                 background: var(--card-bg-soft);
                 color: var(--muted);
             }}
+
+
+            /* Hide the Streamlit header, toolbar, menu, and footer. */
+            header[data-testid="stHeader"] {{
+                display: none !important;
+            }}
+
+            div[data-testid="stToolbar"] {{
+                display: none !important;
+            }}
+
+            div[data-testid="stDecoration"] {{
+                display: none !important;
+            }}
+
+            #MainMenu,
+            footer {{
+                display: none !important;
+            }}
+
+            /* Remove the blank space left above the dashboard. */
+            section.main > div.block-container {{
+                padding-top: 1rem !important;
+            }}
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -1670,10 +1697,25 @@ def create_goals_minus_xg_chart(
         active_theme,
     )
 
+    # Keep selected teams fully vivid, while fading all other teams into
+    # the background so the active selection is immediately clearer.
+    unselected_bar_opacity = 0.24
+
+    muted_hex = active_theme["muted"].lstrip("#")
+
+    muted_bar_colour = (
+        f"rgba("
+        f"{int(muted_hex[0:2], 16)}, "
+        f"{int(muted_hex[2:4], 16)}, "
+        f"{int(muted_hex[4:6], 16)}, "
+        f"{unselected_bar_opacity}"
+        f")"
+    )
+
     chart_data["bar_colour"] = (
         chart_data["team_name"]
         .map(highlighted_colours)
-        .fillna(active_theme["muted"])
+        .fillna(muted_bar_colour)
     )
 
     figure = go.Figure()
@@ -1874,21 +1916,33 @@ def get_weather_description(weather_code: int) -> str:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_current_venue_weather(
-    latitude: float,
-    longitude: float,
-) -> dict[str, object] | None:
+def get_current_venue_weather_batch(
+    venue_locations: tuple[tuple[str, float, float], ...],
+) -> dict[str, object]:
     """
-    Request current weather for one venue.
+    Retrieve live weather for all visible venues in one Open-Meteo request.
 
-    The cached result lasts for 900 seconds, which is 15 minutes.
-    This avoids making a new API request every time a dashboard filter changes.
+    The result is cached for 15 minutes. Using one request prevents a slow
+    venue from holding up every other stadium's weather details.
     """
+    if not venue_locations:
+        return {
+            "ok": True,
+            "records": [],
+            "error": None,
+        }
+
     api_url = "https://api.open-meteo.com/v1/forecast"
 
     parameters = {
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": ",".join(
+            f"{latitude:.6f}"
+            for _, latitude, _ in venue_locations
+        ),
+        "longitude": ",".join(
+            f"{longitude:.6f}"
+            for _, _, longitude in venue_locations
+        ),
         "current": (
             "temperature_2m,"
             "apparent_temperature,"
@@ -1906,29 +1960,120 @@ def get_current_venue_weather(
         response = requests.get(
             api_url,
             params=parameters,
-            timeout=10,
+            timeout=6,
         )
-
         response.raise_for_status()
+        response_payload = response.json()
 
-        weather_data = response.json()
-        current_weather = weather_data.get("current")
-
-        if not current_weather:
-            return None
+    except requests.Timeout:
+        LOGGER.warning("Open-Meteo venue-weather request timed out.")
 
         return {
-            "time": current_weather.get("time"),
-            "temperature": current_weather.get("temperature_2m"),
-            "feels_like": current_weather.get("apparent_temperature"),
-            "humidity": current_weather.get("relative_humidity_2m"),
-            "precipitation": current_weather.get("precipitation"),
-            "weather_code": current_weather.get("weather_code"),
-            "wind_speed": current_weather.get("wind_speed_10m"),
+            "ok": False,
+            "records": [],
+            "error": (
+                "The weather service took too long to respond. "
+                "Please try Refresh live weather."
+            ),
         }
 
-    except (requests.RequestException, ValueError):
-        return None
+    except requests.RequestException as error:
+        LOGGER.warning(
+            "Open-Meteo venue-weather request failed: %s",
+            error,
+        )
+
+        return {
+            "ok": False,
+            "records": [],
+            "error": (
+                "The weather service could not be reached "
+                f"({type(error).__name__})."
+            ),
+        }
+
+    except ValueError:
+        LOGGER.warning(
+            "Open-Meteo venue-weather response could not be read."
+        )
+
+        return {
+            "ok": False,
+            "records": [],
+            "error": (
+                "The weather service returned an unreadable response."
+            ),
+        }
+
+    weather_payloads = (
+        response_payload
+        if isinstance(response_payload, list)
+        else [response_payload]
+    )
+
+    if len(weather_payloads) != len(venue_locations):
+        LOGGER.warning(
+            "Open-Meteo returned %s venue results for %s requests.",
+            len(weather_payloads),
+            len(venue_locations),
+        )
+
+        return {
+            "ok": False,
+            "records": [],
+            "error": (
+                "The weather service returned an incomplete venue response."
+            ),
+        }
+
+    weather_records = []
+
+    for (
+        stadium_name,
+        _,
+        _,
+    ), venue_payload in zip(
+        venue_locations,
+        weather_payloads,
+    ):
+        current_weather = (
+            venue_payload.get("current", {})
+            if isinstance(venue_payload, dict)
+            else {}
+        )
+
+        weather_code = current_weather.get("weather_code")
+
+        weather_records.append(
+            {
+                "stadium_name": stadium_name,
+                "weather_available": bool(current_weather),
+                "observation_time": current_weather.get("time"),
+                "temperature": current_weather.get("temperature_2m"),
+                "feels_like": current_weather.get(
+                    "apparent_temperature"
+                ),
+                "humidity": current_weather.get(
+                    "relative_humidity_2m"
+                ),
+                "precipitation": current_weather.get(
+                    "precipitation"
+                ),
+                "wind_speed": current_weather.get("wind_speed_10m"),
+                "condition": (
+                    get_weather_description(int(weather_code))
+                    if weather_code is not None
+                    and pd.notna(weather_code)
+                    else "Weather unavailable"
+                ),
+            }
+        )
+
+    return {
+        "ok": True,
+        "records": weather_records,
+        "error": None,
+    }
 
 # -----------------------------------------------------------------------------
 # Fixture weather helper
@@ -4347,90 +4492,85 @@ with venues_tab:
         st.info("No host venues match the active filters.")
 
     else:
-        # Ask Open-Meteo for each active host venue. Individual responses are
-        # already cached for 15 minutes by get_current_venue_weather().
-        weather_records = []
-
-        with st.spinner("Loading current weather for host venues..."):
-            for venue in venue_map.itertuples(index=False):
-                weather = get_current_venue_weather(
-                    latitude=float(venue.latitude),
-                    longitude=float(venue.longitude),
-                )
-
-                weather_code = (
-                    weather.get("weather_code")
-                    if weather is not None
-                    else None
-                )
-
-                condition = (
-                    get_weather_description(int(weather_code))
-                    if weather_code is not None
-                    and pd.notna(weather_code)
-                    else "Weather unavailable"
-                )
-
-                weather_records.append(
-                    {
-                        "stadium_name": venue.stadium_name,
-                        "weather_available": weather is not None,
-                        "observation_time": (
-                            weather.get("time")
-                            if weather is not None
-                            else None
-                        ),
-                        "temperature": (
-                            weather.get("temperature")
-                            if weather is not None
-                            else None
-                        ),
-                        "feels_like": (
-                            weather.get("feels_like")
-                            if weather is not None
-                            else None
-                        ),
-                        "humidity": (
-                            weather.get("humidity")
-                            if weather is not None
-                            else None
-                        ),
-                        "precipitation": (
-                            weather.get("precipitation")
-                            if weather is not None
-                            else None
-                        ),
-                        "wind_speed": (
-                            weather.get("wind_speed")
-                            if weather is not None
-                            else None
-                        ),
-                        "condition": condition,
-                    }
-                )
-
-        weather_map = venue_map.merge(
-            pd.DataFrame(weather_records),
-            on="stadium_name",
-            how="left",
+                # Build a stable, duplicate-free list of venues for one batch request.
+        weather_request_venues = (
+            venue_map[
+                [
+                    "stadium_name",
+                    "latitude",
+                    "longitude",
+                ]
+            ]
+            .dropna(
+                subset=[
+                    "latitude",
+                    "longitude",
+                ]
+            )
+            .drop_duplicates(
+                subset="stadium_name"
+            )
+            .sort_values("stadium_name")
         )
 
-        # Keep only venues for which the weather service returned a response.
-        weather_map = weather_map.loc[
-            weather_map["weather_available"].eq(True)
-        ].copy()
+        venue_locations = tuple(
+            (
+                str(venue.stadium_name),
+                float(venue.latitude),
+                float(venue.longitude),
+            )
+            for venue in weather_request_venues.itertuples(
+                index=False
+            )
+        )
 
-        if weather_map.empty:
+        if not venue_locations:
             st.warning(
-                "Current weather could not be retrieved for the active "
-                "host venues. Check your internet connection and try again."
+                "Weather cannot be loaded because the active venues do not "
+                "have valid latitude and longitude values."
             )
 
         else:
-            st.markdown(
-                '<div class="section-label">Live venue weather</div>',
-                unsafe_allow_html=True,
-            )
+            if st.button(
+                "Refresh live weather",
+                key="refresh_venue_weather",
+            ):
+                get_current_venue_weather_batch.clear()
+
+            with st.spinner("Loading current weather for host venues..."):
+                weather_result = get_current_venue_weather_batch(
+                    venue_locations
+                )
+
+            if not weather_result["ok"]:
+                st.warning(
+                    "Current weather could not be retrieved for the active "
+                    "host venues."
+                )
+                st.caption(weather_result["error"])
+
+            else:
+                weather_map = venue_map.merge(
+                    pd.DataFrame(weather_result["records"]),
+                    on="stadium_name",
+                    how="left",
+                )
+
+                weather_map = weather_map.loc[
+                    weather_map["weather_available"].eq(True)
+                ].copy()
+
+                if weather_map.empty:
+                    st.warning(
+                        "The weather service responded, but no usable live "
+                        "weather readings were available for these venues."
+                    )
+
+                else:
+                    st.markdown(
+                        '<div class="section-label">Live venue weather</div>',
+                        unsafe_allow_html=True,
+                    )
 
             weather_metric_options = {
                 "Temperature (°C)": (
@@ -4466,13 +4606,8 @@ with venues_tab:
                 )
 
             with map_note_column:
-                st.caption(
-                    "Each marker is one stadium. Smaller fixed-size markers "
-                    "keep nearby north-east venues easier to inspect; use the "
-                    "hover card for full weather and venue details."
-                )
-
-            metric_column, metric_label, metric_unit = (
+                
+                metric_column, metric_label, metric_unit = (
                 weather_metric_options[selected_weather_metric]
             )
 
