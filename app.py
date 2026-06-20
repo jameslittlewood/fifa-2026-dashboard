@@ -2087,101 +2087,244 @@ def get_fixture_weather(
     kickoff_utc_iso: str,
 ) -> dict[str, object]:
     """
-    Retrieve hourly weather nearest to a fixture's kick-off time.
+    Retrieve weather nearest to a fixture's kick-off time.
 
-    Past fixtures use Open-Meteo's historical endpoint.
-    Upcoming fixtures use Open-Meteo's forecast endpoint.
+    Past fixtures use Open-Meteo historical data.
+    Upcoming fixtures use WeatherAPI forecasts.
     """
-
     kickoff_utc = pd.to_datetime(kickoff_utc_iso, utc=True)
     current_time_utc = pd.Timestamp.now(tz="UTC")
 
-    weather_fields = [
-        "temperature_2m",
-        "apparent_temperature",
-        "precipitation",
-        "weather_code",
-        "wind_speed_10m",
-    ]
+    def optional_number(value: object) -> float | None:
+        """Return a float where possible, otherwise None."""
+        try:
+            return None if pd.isna(value) else float(value)
+        except (TypeError, ValueError):
+            return None
 
-    # A completed or past fixture uses historical modelled weather data.
+    # -------------------------------------------------------------------------
+    # Past fixtures: retain Open-Meteo historical weather.
+    # -------------------------------------------------------------------------
     if kickoff_utc <= current_time_utc:
-        api_url = "https://archive-api.open-meteo.com/v1/archive"
+        historical_url = "https://archive-api.open-meteo.com/v1/archive"
 
-        weather_type = "historical"
-
-        parameters = {
+        historical_parameters = {
             "latitude": latitude,
             "longitude": longitude,
             "start_date": kickoff_utc.strftime("%Y-%m-%d"),
             "end_date": kickoff_utc.strftime("%Y-%m-%d"),
-            "hourly": ",".join(
-                weather_fields + ["relative_humidity_2m"]
+            "hourly": (
+                "temperature_2m,"
+                "apparent_temperature,"
+                "precipitation,"
+                "weather_code,"
+                "wind_speed_10m,"
+                "relative_humidity_2m"
             ),
             "timezone": "UTC",
         }
 
-    # A future fixture uses forecast data, provided it is close enough.
-    else:
-        forecast_limit = current_time_utc + pd.Timedelta(days=16)
+        try:
+            response = requests.get(
+                historical_url,
+                params=historical_parameters,
+                timeout=15,
+            )
+            response.raise_for_status()
 
-        if kickoff_utc > forecast_limit:
+            response_data = response.json()
+            hourly_data = response_data.get("hourly")
+
+            if not hourly_data:
+                return {
+                    "status": "error",
+                    "message": "No historical hourly weather data was returned.",
+                }
+
+            hourly_weather = pd.DataFrame(hourly_data)
+
+            if hourly_weather.empty:
+                return {
+                    "status": "error",
+                    "message": "No historical hourly weather data was returned.",
+                }
+
+            hourly_weather["time"] = pd.to_datetime(
+                hourly_weather["time"],
+                utc=True,
+                errors="coerce",
+            )
+
+            hourly_weather = hourly_weather.dropna(subset=["time"])
+
+            if hourly_weather.empty:
+                return {
+                    "status": "error",
+                    "message": "No usable historical weather data was returned.",
+                }
+
+            nearest_row_index = (
+                hourly_weather["time"] - kickoff_utc
+            ).abs().idxmin()
+
+            weather_row = hourly_weather.loc[nearest_row_index]
+
+            nearest_time_uk = weather_row["time"].tz_convert(
+                "Europe/London"
+            )
+
             return {
-                "status": "unavailable",
+                "status": "available",
+                "weather_type": "historical",
+                "weather_time_uk": nearest_time_uk.strftime(
+                    "%a %d %b, %H:%M %Z"
+                ),
+                "temperature": optional_number(
+                    weather_row.get("temperature_2m")
+                ),
+                "feels_like": optional_number(
+                    weather_row.get("apparent_temperature")
+                ),
+                "precipitation": optional_number(
+                    weather_row.get("precipitation")
+                ),
+                "wind_speed": optional_number(
+                    weather_row.get("wind_speed_10m")
+                ),
+                "humidity": optional_number(
+                    weather_row.get("relative_humidity_2m")
+                ),
+                "rain_probability": None,
+                "weather_code": int(weather_row["weather_code"]),
+                "condition": None,
+            }
+
+        except requests.RequestException as error:
+            LOGGER.warning(
+                "Historical fixture weather request failed: %s",
+                error,
+            )
+
+            return {
+                "status": "error",
                 "message": (
-                    "Forecasts are available once a fixture is within "
-                    "16 days of kick-off."
+                    "Historical weather data could not be retrieved. "
+                    "Please try again later."
                 ),
             }
 
-        api_url = "https://api.open-meteo.com/v1/forecast"
+        except (ValueError, KeyError, TypeError) as error:
+            LOGGER.warning(
+                "Historical fixture weather response could not be read: %s",
+                error,
+            )
 
-        weather_type = "forecast"
+            return {
+                "status": "error",
+                "message": (
+                    "Historical weather data could not be read."
+                ),
+            }
 
-        parameters = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "start_date": kickoff_utc.strftime("%Y-%m-%d"),
-            "end_date": kickoff_utc.strftime("%Y-%m-%d"),
-            "hourly": ",".join(
-                weather_fields + ["precipitation_probability"]
+    # -------------------------------------------------------------------------
+    # Upcoming fixtures: use WeatherAPI instead of Open-Meteo.
+    # -------------------------------------------------------------------------
+    api_key = os.environ.get("WEATHER_API_KEY", "").strip()
+
+    if not api_key:
+        return {
+            "status": "error",
+            "message": (
+                "Fixture forecasts are not configured on the dashboard server."
             ),
-            "timezone": "UTC",
         }
+
+    forecast_limit = current_time_utc + pd.Timedelta(days=3)
+
+    if kickoff_utc > forecast_limit:
+        return {
+            "status": "unavailable",
+            "message": (
+                "Fixture forecasts are available once a match is within "
+                "3 days of kick-off."
+            ),
+        }
+
+    forecast_url = "https://api.weatherapi.com/v1/forecast.json"
+
+    forecast_parameters = {
+        "key": api_key,
+        "q": f"{latitude:.6f},{longitude:.6f}",
+        "days": 3,
+        "dt": kickoff_utc.strftime("%Y-%m-%d"),
+        "aqi": "no",
+        "alerts": "no",
+    }
 
     try:
         response = requests.get(
-            api_url,
-            params=parameters,
-            timeout=15,
+            forecast_url,
+            params=forecast_parameters,
+            timeout=12,
         )
-
         response.raise_for_status()
 
         response_data = response.json()
-        hourly_data = response_data.get("hourly")
+
+        if "error" in response_data:
+            LOGGER.warning(
+                "WeatherAPI fixture forecast error: %s",
+                response_data["error"],
+            )
+
+            return {
+                "status": "error",
+                "message": (
+                    "The weather provider could not return a fixture forecast."
+                ),
+            }
+
+        forecast_days = (
+            response_data.get("forecast", {})
+            .get("forecastday", [])
+        )
+
+        if not forecast_days:
+            return {
+                "status": "error",
+                "message": "No forecast weather data was returned.",
+            }
+
+        hourly_data = forecast_days[0].get("hour", [])
 
         if not hourly_data:
             return {
                 "status": "error",
-                "message": "No hourly weather data was returned.",
+                "message": "No hourly forecast weather data was returned.",
             }
 
         hourly_weather = pd.DataFrame(hourly_data)
 
-        if hourly_weather.empty:
+        if hourly_weather.empty or "time_epoch" not in hourly_weather.columns:
             return {
                 "status": "error",
-                "message": "No hourly weather data was returned.",
+                "message": "No usable hourly forecast weather data was returned.",
             }
 
         hourly_weather["time"] = pd.to_datetime(
-            hourly_weather["time"],
+            hourly_weather["time_epoch"],
+            unit="s",
             utc=True,
             errors="coerce",
         )
 
         hourly_weather = hourly_weather.dropna(subset=["time"])
+
+        if hourly_weather.empty:
+            return {
+                "status": "error",
+                "message": "No usable hourly forecast weather data was returned.",
+            }
 
         nearest_row_index = (
             hourly_weather["time"] - kickoff_utc
@@ -2189,9 +2332,13 @@ def get_fixture_weather(
 
         weather_row = hourly_weather.loc[nearest_row_index]
 
-        def optional_number(value):
-            """Return a float where possible, otherwise None."""
-            return None if pd.isna(value) else float(value)
+        condition_data = weather_row.get("condition", {})
+
+        condition_text = (
+            condition_data.get("text", "Weather unavailable")
+            if isinstance(condition_data, dict)
+            else "Weather unavailable"
+        )
 
         nearest_time_uk = weather_row["time"].tz_convert(
             "Europe/London"
@@ -2199,42 +2346,69 @@ def get_fixture_weather(
 
         return {
             "status": "available",
-            "weather_type": weather_type,
+            "weather_type": "forecast",
             "weather_time_uk": nearest_time_uk.strftime(
                 "%a %d %b, %H:%M %Z"
             ),
-            "temperature": optional_number(
-                weather_row.get("temperature_2m")
-            ),
-            "feels_like": optional_number(
-                weather_row.get("apparent_temperature")
-            ),
-            "precipitation": optional_number(
-                weather_row.get("precipitation")
-            ),
-            "wind_speed": optional_number(
-                weather_row.get("wind_speed_10m")
-            ),
-            "humidity": optional_number(
-                weather_row.get("relative_humidity_2m")
-            ),
+            "temperature": optional_number(weather_row.get("temp_c")),
+            "feels_like": optional_number(weather_row.get("feelslike_c")),
+            "precipitation": optional_number(weather_row.get("precip_mm")),
+            "wind_speed": optional_number(weather_row.get("wind_kph")),
+            "humidity": optional_number(weather_row.get("humidity")),
             "rain_probability": optional_number(
-                weather_row.get("precipitation_probability")
+                weather_row.get("chance_of_rain")
             ),
-            "weather_code": int(weather_row["weather_code"]),
+            "weather_code": None,
+            "condition": condition_text,
         }
 
-    except (
-        requests.RequestException,
-        ValueError,
-        KeyError,
-        TypeError,
-    ):
+    except requests.HTTPError as error:
+        status_code = (
+            error.response.status_code
+            if error.response is not None
+            else "unknown"
+        )
+
+        LOGGER.warning(
+            "WeatherAPI fixture forecast failed. status=%s body=%s",
+            status_code,
+            error.response.text[:300]
+            if error.response is not None
+            else "",
+        )
+
         return {
             "status": "error",
             "message": (
-                "Weather data could not be retrieved. "
-                "Check your internet connection and try again."
+                "The weather provider could not return a fixture forecast "
+                f"(HTTP {status_code})."
+            ),
+        }
+
+    except requests.RequestException as error:
+        LOGGER.warning(
+            "WeatherAPI fixture forecast connection failed: %s",
+            error,
+        )
+
+        return {
+            "status": "error",
+            "message": (
+                "Fixture forecast data could not be retrieved. "
+                "Please try again later."
+            ),
+        }
+
+    except (ValueError, KeyError, TypeError) as error:
+        LOGGER.warning(
+            "WeatherAPI fixture forecast response could not be read: %s",
+            error,
+        )
+
+        return {
+            "status": "error",
+            "message": (
+                "Fixture forecast data could not be read."
             ),
         }
     
@@ -2735,9 +2909,10 @@ with overview_tab:
                     st.warning(fixture_weather["message"])
 
                 else:
-                    weather_description = get_weather_description(
-                        fixture_weather["weather_code"]
-                    )
+                    weather_description = (
+                        fixture_weather.get("condition")
+                        or get_weather_description(fixture_weather["weather_code"])
+)
 
                     if fixture_weather["weather_type"] == "forecast":
                         weather_heading = "Forecast at kick-off"
