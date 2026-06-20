@@ -1953,7 +1953,6 @@ def get_current_venue_weather_batch(
         ),
         "temperature_unit": "celsius",
         "wind_speed_unit": "kmh",
-        "timezone": "auto",
     }
 
     try:
@@ -4548,7 +4547,8 @@ with venues_tab:
                     "host venues."
                 )
                 st.caption(weather_result["error"])
-
+                st.stop()
+                
             else:
                 weather_map = venue_map.merge(
                     pd.DataFrame(weather_result["records"]),
