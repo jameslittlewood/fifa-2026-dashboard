@@ -1,6 +1,7 @@
 from pathlib import Path
 from html import escape
 import logging
+import os
 import unicodedata
 
 import pandas as pd
@@ -1915,16 +1916,29 @@ def get_weather_description(weather_code: int) -> str:
     return WEATHER_CODES.get(weather_code, "Weather unavailable")
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_current_venue_weather_batch(
     venue_locations: tuple[tuple[str, float, float], ...],
 ) -> dict[str, object]:
     """
-    Retrieve live weather for all visible venues in one Open-Meteo request.
+    Retrieve current weather for visible venues using WeatherAPI.
 
-    The result is cached for 15 minutes. Using one request prevents a slow
-    venue from holding up every other stadium's weather details.
+    WeatherAPI standard plans use one request per location, so the result is
+    cached for one hour to keep API usage low for the public dashboard.
     """
+    api_key = os.environ.get("WEATHER_API_KEY", "").strip()
+
+    if not api_key:
+        LOGGER.error("WEATHER_API_KEY is not configured.")
+
+        return {
+            "ok": False,
+            "records": [],
+            "error": (
+                "Live weather is not configured on the dashboard server."
+            ),
+        }
+
     if not venue_locations:
         return {
             "ok": True,
@@ -1932,170 +1946,98 @@ def get_current_venue_weather_batch(
             "error": None,
         }
 
-    api_url = "https://api.open-meteo.com/v1/forecast"
-
-    parameters = {
-        "latitude": ",".join(
-            f"{latitude:.6f}"
-            for _, latitude, _ in venue_locations
-        ),
-        "longitude": ",".join(
-            f"{longitude:.6f}"
-            for _, _, longitude in venue_locations
-        ),
-        "current": (
-            "temperature_2m,"
-            "apparent_temperature,"
-            "relative_humidity_2m,"
-            "precipitation,"
-            "weather_code,"
-            "wind_speed_10m"
-        ),
-        "temperature_unit": "celsius",
-        "wind_speed_unit": "kmh",
-    }
-
-    try:
-        response = requests.get(
-            api_url,
-            params=parameters,
-            timeout=6,
-        )
-        response.raise_for_status()
-        response_payload = response.json()
-
-    except requests.Timeout:
-        LOGGER.warning("Open-Meteo venue-weather request timed out.")
-
-        return {
-            "ok": False,
-            "records": [],
-            "error": (
-                "The weather service took too long to respond. "
-                "Please try Refresh live weather."
-            ),
-        }
-
-    except requests.HTTPError as error:
-        status_code = (
-            error.response.status_code
-            if error.response is not None
-            else "unknown"
-        )
-
-        response_body = (
-            error.response.text[:500]
-            if error.response is not None
-            else ""
-        )
-
-        LOGGER.warning(
-            "Open-Meteo venue weather failed. "
-            "status=%s url=%s body=%s",
-            status_code,
-            error.response.url if error.response is not None else api_url,
-            response_body,
-        )
-
-        return {
-            "ok": False,
-            "records": [],
-            "error": (
-                "The weather provider rejected this request "
-                f"(HTTP {status_code})."
-            ),
-        }
-
-    except requests.RequestException as error:
-        LOGGER.warning(
-            "Open-Meteo venue weather connection failed: %s",
-            error,
-        )
-
-        return {
-            "ok": False,
-            "records": [],
-            "error": (
-                "The weather service could not be reached "
-                f"({type(error).__name__})."
-            ),
-        }
-
-    except ValueError:
-        LOGGER.warning(
-            "Open-Meteo venue-weather response could not be read."
-        )
-
-        return {
-            "ok": False,
-            "records": [],
-            "error": (
-                "The weather service returned an unreadable response."
-            ),
-        }
-
-    weather_payloads = (
-        response_payload
-        if isinstance(response_payload, list)
-        else [response_payload]
-    )
-
-    if len(weather_payloads) != len(venue_locations):
-        LOGGER.warning(
-            "Open-Meteo returned %s venue results for %s requests.",
-            len(weather_payloads),
-            len(venue_locations),
-        )
-
-        return {
-            "ok": False,
-            "records": [],
-            "error": (
-                "The weather service returned an incomplete venue response."
-            ),
-        }
+    api_url = "https://api.weatherapi.com/v1/current.json"
 
     weather_records = []
+    failed_venues = []
 
-    for (
-        stadium_name,
-        _,
-        _,
-    ), venue_payload in zip(
-        venue_locations,
-        weather_payloads,
-    ):
-        current_weather = (
-            venue_payload.get("current", {})
-            if isinstance(venue_payload, dict)
-            else {}
-        )
-
-        weather_code = current_weather.get("weather_code")
-
-        weather_records.append(
-            {
-                "stadium_name": stadium_name,
-                "weather_available": bool(current_weather),
-                "observation_time": current_weather.get("time"),
-                "temperature": current_weather.get("temperature_2m"),
-                "feels_like": current_weather.get(
-                    "apparent_temperature"
-                ),
-                "humidity": current_weather.get(
-                    "relative_humidity_2m"
-                ),
-                "precipitation": current_weather.get(
-                    "precipitation"
-                ),
-                "wind_speed": current_weather.get("wind_speed_10m"),
-                "condition": (
-                    get_weather_description(int(weather_code))
-                    if weather_code is not None
-                    and pd.notna(weather_code)
-                    else "Weather unavailable"
-                ),
+    with requests.Session() as session:
+        for stadium_name, latitude, longitude in venue_locations:
+            parameters = {
+                "key": api_key,
+                "q": f"{latitude:.6f},{longitude:.6f}",
+                "aqi": "no",
             }
+
+            try:
+                response = session.get(
+                    api_url,
+                    params=parameters,
+                    timeout=8,
+                )
+                response.raise_for_status()
+                weather_payload = response.json()
+
+            except requests.Timeout:
+                LOGGER.warning(
+                    "WeatherAPI request timed out for %s.",
+                    stadium_name,
+                )
+                failed_venues.append(stadium_name)
+                continue
+
+            except requests.RequestException as error:
+                LOGGER.warning(
+                    "WeatherAPI request failed for %s: %s",
+                    stadium_name,
+                    error,
+                )
+                failed_venues.append(stadium_name)
+                continue
+
+            except ValueError:
+                LOGGER.warning(
+                    "WeatherAPI returned invalid JSON for %s.",
+                    stadium_name,
+                )
+                failed_venues.append(stadium_name)
+                continue
+
+            current_weather = weather_payload.get("current", {})
+
+            if not current_weather:
+                LOGGER.warning(
+                    "WeatherAPI returned no current data for %s.",
+                    stadium_name,
+                )
+                failed_venues.append(stadium_name)
+                continue
+
+            condition = current_weather.get("condition", {})
+
+            weather_records.append(
+                {
+                    "stadium_name": stadium_name,
+                    "weather_available": True,
+                    "observation_time": current_weather.get(
+                        "last_updated"
+                    ),
+                    "temperature": current_weather.get("temp_c"),
+                    "feels_like": current_weather.get("feelslike_c"),
+                    "humidity": current_weather.get("humidity"),
+                    "precipitation": current_weather.get("precip_mm"),
+                    "wind_speed": current_weather.get("wind_kph"),
+                    "condition": condition.get(
+                        "text",
+                        "Weather unavailable",
+                    ),
+                }
+            )
+
+    if not weather_records:
+        return {
+            "ok": False,
+            "records": [],
+            "error": (
+                "The weather provider did not return usable weather data "
+                "for the active venues."
+            ),
+        }
+
+    if failed_venues:
+        LOGGER.warning(
+            "WeatherAPI did not return weather for: %s",
+            ", ".join(failed_venues),
         )
 
     return {
