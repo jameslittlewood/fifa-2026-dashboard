@@ -1976,9 +1976,39 @@ def get_current_venue_weather_batch(
             ),
         }
 
+    except requests.HTTPError as error:
+        status_code = (
+            error.response.status_code
+            if error.response is not None
+            else "unknown"
+        )
+
+        response_body = (
+            error.response.text[:500]
+            if error.response is not None
+            else ""
+        )
+
+        LOGGER.warning(
+            "Open-Meteo venue weather failed. "
+            "status=%s url=%s body=%s",
+            status_code,
+            error.response.url if error.response is not None else api_url,
+            response_body,
+        )
+
+        return {
+            "ok": False,
+            "records": [],
+            "error": (
+                "The weather provider rejected this request "
+                f"(HTTP {status_code})."
+            ),
+        }
+
     except requests.RequestException as error:
         LOGGER.warning(
-            "Open-Meteo venue-weather request failed: %s",
+            "Open-Meteo venue weather connection failed: %s",
             error,
         )
 
@@ -4548,7 +4578,7 @@ with venues_tab:
                 )
                 st.caption(weather_result["error"])
                 st.stop()
-                
+
             else:
                 weather_map = venue_map.merge(
                     pd.DataFrame(weather_result["records"]),
