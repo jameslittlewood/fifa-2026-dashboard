@@ -1968,6 +1968,15 @@ def get_current_venue_weather_batch(
                 response.raise_for_status()
                 weather_payload = response.json()
 
+                if "error" in weather_payload:
+                    LOGGER.warning(
+                        "WeatherAPI returned an API error for %s: %s",
+                        stadium_name,
+                        weather_payload["error"],
+                    )
+                    failed_venues.append(stadium_name)
+                    continue
+
             except requests.Timeout:
                 LOGGER.warning(
                     "WeatherAPI request timed out for %s.",
@@ -1976,9 +1985,31 @@ def get_current_venue_weather_batch(
                 failed_venues.append(stadium_name)
                 continue
 
+            except requests.HTTPError as error:
+                status_code = (
+                    error.response.status_code
+                    if error.response is not None
+                    else "unknown"
+                )
+
+                response_body = (
+                    error.response.text[:500]
+                    if error.response is not None
+                    else ""
+                )
+
+                LOGGER.warning(
+                    "WeatherAPI request failed for %s. status=%s body=%s",
+                    stadium_name,
+                    status_code,
+                    response_body,
+                )
+                failed_venues.append(stadium_name)
+                continue
+
             except requests.RequestException as error:
                 LOGGER.warning(
-                    "WeatherAPI request failed for %s: %s",
+                    "WeatherAPI connection failed for %s: %s",
                     stadium_name,
                     error,
                 )
