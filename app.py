@@ -2,6 +2,7 @@ from pathlib import Path
 from html import escape
 import logging
 import os
+import re
 import unicodedata
 
 import pandas as pd
@@ -897,19 +898,94 @@ REQUIRED_FILES = [
     "venues.csv",
     "squads_and_players.csv",
     "match_events.csv",
+    "player_tournament_stats.csv",
 ]
+
+# The two player files use slightly different team naming conventions.
+# Convert known variants to one stable join key before merging them.
+TEAM_NAME_ALIASES = {
+    "bosnia herz": "bosnia and herzegovina",
+    "bosnia and herzegovina": "bosnia and herzegovina",
+    "congo dr": "democratic republic of the congo",
+    "dr congo": "democratic republic of the congo",
+    "democratic republic of congo": "democratic republic of the congo",
+    "democratic republic of the congo": "democratic republic of the congo",
+    "ir iran": "iran",
+    "iran": "iran",
+    "korea republic": "south korea",
+    "south korea": "south korea",
+    "republic of korea": "south korea",
+    "turkiye": "turkey",
+    "turkey": "turkey",
+    "united states": "united states",
+    "usa": "united states",
+    "us": "united states",
+    "cote d ivoire": "ivory coast",
+    "ivory coast": "ivory coast",
+}
+
+
+def normalise_join_text(value: object) -> str:
+    """Return a lower-case, accent-free key containing only word characters."""
+    if pd.isna(value):
+        return ""
+
+    text = unicodedata.normalize("NFKD", str(value).casefold())
+    text = "".join(
+        character
+        for character in text
+        if not unicodedata.combining(character)
+    )
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def make_team_join_key(value: object) -> str:
+    """Normalise a team name and map known naming variants together."""
+    normalised = normalise_join_text(value)
+    return TEAM_NAME_ALIASES.get(normalised, normalised)
+
+
+def make_player_full_key(value: object) -> str:
+    """Build a conservative full-name key for player-profile matching."""
+    return normalise_join_text(value)
+
+
+def make_player_short_key(value: object) -> str:
+    """
+    Build a first-and-last-name fallback key.
+
+    The detailed file often omits middle names used by the scenario profile
+    file, so this is used only after a full-name match has been attempted.
+    """
+    name_parts = normalise_join_text(value).split()
+
+    if len(name_parts) < 2:
+        return " ".join(name_parts)
+
+    return f"{name_parts[0]} {name_parts[-1]}"
 
 
 @st.cache_data
 def load_data(
     data_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
     """Read CSV files and make their data types analysis-ready."""
     matches = pd.read_csv(data_dir / "matches_detailed.csv")
     teams = pd.read_csv(data_dir / "teams.csv")
     venues = pd.read_csv(data_dir / "venues.csv")
     players = pd.read_csv(data_dir / "squads_and_players.csv")
     match_events = pd.read_csv(data_dir / "match_events.csv")
+    detailed_player_stats = pd.read_csv(
+        data_dir / "player_tournament_stats.csv"
+    )
 
     matches["date"] = pd.to_datetime(matches["date"], errors="coerce")
 
@@ -940,6 +1016,23 @@ def load_data(
             errors="coerce",
         )
 
+    # Every detailed-stat column apart from player/team/profile text is numeric.
+    detailed_text_columns = {
+        "player",
+        "team",
+        "team_country",
+        "position",
+        "age",
+        "club",
+    }
+
+    for column in detailed_player_stats.columns:
+        if column not in detailed_text_columns:
+            detailed_player_stats[column] = pd.to_numeric(
+                detailed_player_stats[column],
+                errors="coerce",
+            )
+
     group_lookup = teams[["team_name", "group_letter"]].rename(
         columns={"team_name": "home_team_name"}
     )
@@ -950,7 +1043,14 @@ def load_data(
         how="left",
     )
 
-    return matches, teams, venues, players, match_events
+    return (
+        matches,
+        teams,
+        venues,
+        players,
+        match_events,
+        detailed_player_stats,
+    )
 
 
 def build_team_stats(
@@ -1053,41 +1153,181 @@ def build_player_tournament_stats(
     players: pd.DataFrame,
     teams: pd.DataFrame,
     match_events: pd.DataFrame,
+    detailed_player_stats: pd.DataFrame,
     active_match_ids: list[int],
 ) -> pd.DataFrame:
     """
-    Combine player profile data with tournament goal and card totals.
+    Build one detailed tournament-statistics row per player.
 
-    Tournament event totals only include matches currently selected through
-    the sidebar filters.
+    `player_tournament_stats.csv` is the primary source for appearances,
+    minutes, attacking, defensive, discipline and goalkeeper figures.
+    `squads_and_players.csv` is retained for player IDs and career profile
+    fields, which are matched by team plus player name.
+
+    The detailed file is an all-tournament snapshot. Only its team selection
+    follows the sidebar group filter; its totals are not recalculated from a
+    date or match-status subset. Recorded event totals below still respect the
+    active fixture filters.
     """
     team_lookup = teams[
         ["team_id", "team_name"]
-    ].drop_duplicates()
+    ].drop_duplicates().copy()
 
-    player_stats = players.merge(
+    team_lookup["team_join_key"] = team_lookup["team_name"].map(
+        make_team_join_key
+    )
+
+    team_lookup = team_lookup.drop_duplicates(
+        subset="team_join_key",
+        keep="first",
+    )
+
+    # -------------------------------------------------------------------------
+    # Detailed tournament-statistics file: this is the base table.
+    # -------------------------------------------------------------------------
+    player_stats = detailed_player_stats.rename(
+        columns={
+            "player": "player_name",
+            "team": "source_team_name",
+            "club": "club_team",
+        }
+    ).copy()
+
+    player_stats["team_join_key"] = player_stats["source_team_name"].map(
+        make_team_join_key
+    )
+
+    player_stats = player_stats.merge(
         team_lookup,
+        on="team_join_key",
+        how="left",
+    )
+
+    # Preserve the dashboard's team spelling whenever it is available, so
+    # chart labels and group filtering remain consistent across the app.
+    player_stats["team_name"] = player_stats["team_name"].fillna(
+        player_stats["source_team_name"]
+    )
+
+    player_stats["player_full_key"] = player_stats["player_name"].map(
+        make_player_full_key
+    )
+    player_stats["player_short_key"] = player_stats["player_name"].map(
+        make_player_short_key
+    )
+    player_stats["player_key"] = (
+        player_stats["team_join_key"]
+        + "::"
+        + player_stats["player_full_key"]
+    )
+
+    # -------------------------------------------------------------------------
+    # Scenario player profiles: used only for career/profile information and
+    # for the player_id required by match-events records.
+    # -------------------------------------------------------------------------
+    profile_columns = [
+        "player_id",
+        "career_caps",
+        "career_international_goals",
+        "height_cm",
+        "market_value_eur",
+        "profile_club_team",
+        "profile_player_name",
+    ]
+
+    player_profiles = players.merge(
+        team_lookup[["team_id", "team_name", "team_join_key"]],
         on="team_id",
         how="left",
     ).copy()
 
-    # Career international profile measures.
-    for column in ["caps", "goals", "height_cm", "market_value_eur"]:
-        player_stats[column] = pd.to_numeric(
-            player_stats[column],
+    player_profiles = player_profiles.rename(
+        columns={
+            "player_name": "profile_player_name",
+            "goals": "career_international_goals",
+            "caps": "career_caps",
+            "club_team": "profile_club_team",
+        }
+    )
+
+    for column in [
+        "career_caps",
+        "career_international_goals",
+        "height_cm",
+        "market_value_eur",
+    ]:
+        player_profiles[column] = pd.to_numeric(
+            player_profiles[column],
             errors="coerce",
         )
 
+    player_profiles["player_full_key"] = (
+        player_profiles["profile_player_name"].map(make_player_full_key)
+    )
+    player_profiles["player_short_key"] = (
+        player_profiles["profile_player_name"].map(make_player_short_key)
+    )
+
+    # First use a strict full-name match. Drop ambiguous keys rather than
+    # guessing, which avoids attaching a player ID to the wrong person.
+    full_name_profiles = player_profiles[
+        [
+            "team_join_key",
+            "player_full_key",
+            *profile_columns,
+        ]
+    ].drop_duplicates(
+        subset=["team_join_key", "player_full_key"],
+        keep=False,
+    )
+
+    player_stats = player_stats.merge(
+        full_name_profiles,
+        on=["team_join_key", "player_full_key"],
+        how="left",
+    )
+
+    # A safe fallback catches full names such as "Harry Edward Kane" in the
+    # scenario profile versus "Harry Kane" in the detailed dataset. It is only
+    # used where a first-and-last key occurs once within the same team.
+    short_name_profiles = player_profiles[
+        [
+            "team_join_key",
+            "player_short_key",
+            *profile_columns,
+        ]
+    ].drop_duplicates(
+        subset=["team_join_key", "player_short_key"],
+        keep=False,
+    )
+
+    fallback_profiles = player_stats[
+        ["team_join_key", "player_short_key"]
+    ].merge(
+        short_name_profiles,
+        on=["team_join_key", "player_short_key"],
+        how="left",
+    )
+
+    for column in profile_columns:
+        player_stats[column] = player_stats[column].combine_first(
+            fallback_profiles[column]
+        )
+
     player_stats["goals_per_cap"] = (
-        player_stats["goals"]
-        / player_stats["caps"].replace(0, pd.NA)
+        player_stats["career_international_goals"]
+        / player_stats["career_caps"].replace(0, pd.NA)
     ).fillna(0)
 
     player_stats["market_value_millions"] = (
         player_stats["market_value_eur"].fillna(0) / 1_000_000
     )
 
-    # Keep only goal and card events from the currently filtered fixtures.
+    # -------------------------------------------------------------------------
+    # Event data remains useful for the expandable match log. These fields are
+    # deliberately named "filtered_*" so they are not confused with detailed
+    # all-tournament totals from the new CSV.
+    # -------------------------------------------------------------------------
     relevant_events = match_events.loc[
         match_events["match_id"].isin(active_match_ids)
         & match_events["event_type"].isin(
@@ -1101,9 +1341,9 @@ def build_player_tournament_stats(
 
     event_columns = [
         "player_id",
-        "tournament_goals",
-        "yellow_cards",
-        "red_cards",
+        "filtered_event_goals",
+        "filtered_yellow_cards",
+        "filtered_red_cards",
     ]
 
     event_counts = pd.DataFrame(columns=event_columns)
@@ -1118,9 +1358,9 @@ def build_player_tournament_stats(
             .reset_index()
             .rename(
                 columns={
-                    "Goal": "tournament_goals",
-                    "Yellow Card": "yellow_cards",
-                    "Red Card": "red_cards",
+                    "Goal": "filtered_event_goals",
+                    "Yellow Card": "filtered_yellow_cards",
+                    "Red Card": "filtered_red_cards",
                 }
             )
         )
@@ -1150,6 +1390,7 @@ def build_player_tournament_stats(
                     lambda minutes: ", ".join(
                         f"{int(minute)}'"
                         for minute in sorted(minutes)
+                        if pd.notna(minute)
                     )
                 )
                 .reset_index(name="goal_minutes")
@@ -1168,17 +1409,47 @@ def build_player_tournament_stats(
     )
 
     for column in [
-        "tournament_goals",
-        "yellow_cards",
-        "red_cards",
+        "filtered_event_goals",
+        "filtered_yellow_cards",
+        "filtered_red_cards",
     ]:
         player_stats[column] = (
-            player_stats[column].fillna(0).astype(int)
+            pd.to_numeric(player_stats[column], errors="coerce")
+            .fillna(0)
+            .astype(int)
         )
 
     player_stats["goal_minutes"] = (
         player_stats["goal_minutes"].fillna("—")
     )
+
+    # Keep numeric chart fields consistent when a player did not record a
+    # particular type of action. Career-profile fields remain NaN if no
+    # reliable profile match was found, so the interface can show a dash.
+    numeric_stat_columns = [
+        column
+        for column in detailed_player_stats.columns
+        if column
+        not in {
+            "player",
+            "team",
+            "team_country",
+            "position",
+            "age",
+            "club",
+        }
+    ]
+
+    for column in numeric_stat_columns:
+        if column in player_stats.columns:
+            player_stats[column] = pd.to_numeric(
+                player_stats[column],
+                errors="coerce",
+            ).fillna(0)
+
+    player_stats["club_team"] = player_stats["club_team"].fillna(
+        player_stats["profile_club_team"]
+    ).fillna("—")
 
     player_stats["player_label"] = (
         player_stats["player_name"].fillna("Unknown player")
@@ -1192,6 +1463,7 @@ def build_player_tournament_stats(
     return player_stats.sort_values(
         ["team_name", "player_name"]
     ).reset_index(drop=True)
+
 
 def make_fixture_table(matches: pd.DataFrame) -> pd.DataFrame:
     """Make a compact, chronologically ordered fixture/results table."""
@@ -1299,11 +1571,12 @@ def themed_selectbox(
     help_text: str | None = None,
     search_placeholder: str = "Filter options",
 ) -> object:
-    """
-    Render a themed single-select control without Streamlit's popup selectbox.
+    """Render a compact native selectbox that opens as an overlay menu.
 
-    The selector uses an expander and radio list inside the normal page DOM,
-    which avoids the unthemeable BaseWeb portal corners from Streamlit popups.
+    Unlike the previous expander-and-radio implementation, Streamlit's native
+    selectbox opens its options in a floating portal. This means opening a
+    menu does not change the page layout or push charts and other content
+    downward.
     """
     option_list = list(options)
 
@@ -1320,9 +1593,10 @@ def themed_selectbox(
         current_value = option_list[0]
         st.session_state[key] = current_value
 
-    summary_label = format_func(current_value)
-    search_key = f"{key}__search"
-    radio_key = f"{key}__radio"
+    # Remove state created by the legacy expander/radio selector. It is no
+    # longer used now that controls open as floating dropdown menus.
+    st.session_state.pop(f"{key}__search", None)
+    st.session_state.pop(f"{key}__radio", None)
 
     st.markdown(
         f'<div class="selector-field-label">{escape(label)}</div>',
@@ -1332,52 +1606,14 @@ def themed_selectbox(
     if help_text:
         st.caption(help_text)
 
-    with st.expander(summary_label, expanded=False):
-        filtered_options = option_list
-
-        if len(option_list) > 8:
-            search_value = st.text_input(
-                f"Search {label}",
-                key=search_key,
-                placeholder=search_placeholder,
-                label_visibility="collapsed",
-            ).strip()
-
-            if search_value:
-                needle = search_value.casefold()
-                filtered_options = [
-                    option
-                    for option in option_list
-                    if needle in format_func(option).casefold()
-                ]
-
-        if not filtered_options:
-            st.caption("No options match the current search.")
-            return current_value
-
-        default_value = (
-            current_value
-            if current_value in filtered_options
-            else filtered_options[0]
-        )
-
-        if st.session_state.get(radio_key) not in filtered_options:
-            st.session_state[radio_key] = default_value
-
-        selected_value = st.radio(
-            f"{label} options",
-            filtered_options,
-            index=filtered_options.index(default_value),
-            format_func=format_func,
-            key=radio_key,
-            label_visibility="collapsed",
-        )
-
-        if selected_value != current_value:
-            st.session_state[key] = selected_value
-            st.rerun()
-
-    return current_value
+    return st.selectbox(
+        label,
+        option_list,
+        index=option_list.index(current_value),
+        format_func=format_func,
+        key=key,
+        label_visibility="collapsed",
+    )
 
 
 def _normalize_label(value: object) -> str:
@@ -2437,7 +2673,14 @@ if missing:
     st.write("Missing:", ", ".join(missing))
     st.stop()
 
-matches, teams, venues, players, match_events = load_data(DATA_DIR)
+(
+    matches,
+    teams,
+    venues,
+    players,
+    match_events,
+    detailed_player_stats,
+) = load_data(DATA_DIR)
 
 
 # -----------------------------------------------------------------------------
@@ -2734,16 +2977,23 @@ player_tournament_stats = build_player_tournament_stats(
     players,
     teams,
     match_events,
+    detailed_player_stats,
     active_match_ids,
 )
 
-active_team_ids = teams.loc[
-    teams["group_letter"].isin(selected_groups),
-    "team_id",
-].tolist()
+# The detailed player file contains full-tournament totals. Group selection can
+# safely limit the available teams; date and status filters continue to apply
+# to fixture- and venue-based parts of the dashboard.
+active_team_keys = {
+    make_team_join_key(team_name)
+    for team_name in teams.loc[
+        teams["group_letter"].isin(selected_groups),
+        "team_name",
+    ].dropna()
+}
 
 player_tournament_stats = player_tournament_stats.loc[
-    player_tournament_stats["team_id"].isin(active_team_ids)
+    player_tournament_stats["team_join_key"].isin(active_team_keys)
 ].copy()
 
 # -----------------------------------------------------------------------------
@@ -3833,17 +4083,11 @@ with teams_tab:
 # -----------------------------------------------------------------------------
 with players_tab:
     st.markdown(
-        '<div class="section-label">Player comparison</div>',
+        '<div class="section-label">Detailed player analysis</div>',
         unsafe_allow_html=True,
     )
 
     st.subheader("Compare up to four players")
-
-    st.caption(
-        "Tournament goals and cards follow the current fixture filters. "
-        "Caps, career international goals, club, height and market value "
-        "come from player-profile data in the scenario dataset."
-    )
 
     # -------------------------------------------------------------------------
     # Position filter
@@ -3868,7 +4112,7 @@ with players_tab:
 
     if available_players.empty:
         st.info(
-            "No players match the selected position and current sidebar filters."
+            "No players match the selected position and current group filter."
         )
 
     else:
@@ -3876,32 +4120,31 @@ with players_tab:
         # Player dropdown setup
         # ---------------------------------------------------------------------
         player_label_lookup = (
-            available_players.set_index("player_id")["player_label"].to_dict()
+            available_players.set_index("player_key")["player_label"].to_dict()
         )
 
         # None is the "No player selected" option.
         player_selector_options = [
             None,
-            *available_players["player_id"].tolist(),
+            *available_players["player_key"].tolist(),
         ]
 
-        def format_player_option(player_id):
-            """Turn a player ID into a readable dropdown label."""
-            if player_id is None:
+        def format_player_option(player_key):
+            """Turn a stable player key into a readable selector label."""
+            if player_key is None:
                 return "No player selected"
 
-            return player_label_lookup[player_id]
+            return player_label_lookup[player_key]
 
         player_name_lookup = (
-            available_players.set_index("player_id")["player_name"].to_dict()
+            available_players.set_index("player_key")["player_name"].to_dict()
         )
 
-        # On first load, use the intended four-player comparison. If a position
-        # filter later removes a chosen player, replace only that invalid value.
+        # These are the names used by the detailed statistics file.
         default_player_labels = {
-            "player_1_selector": "Harry Edward Kane",
-            "player_2_selector": "Michael Akpovie Olise",
-            "player_3_selector": "Lionel Andrés Messi",
+            "player_1_selector": "Harry Kane",
+            "player_2_selector": "Michael Olise",
+            "player_3_selector": "Lionel Messi",
             "player_4_selector": "Kylian Mbappé",
         }
 
@@ -3920,10 +4163,11 @@ with players_tab:
                 or saved_value not in player_selector_options
             ):
                 desired_label = default_player_labels[selector_key]
+
                 default_player = pick_option_by_label(
-                    available_players["player_id"].tolist(),
+                    available_players["player_key"].tolist(),
                     desired_label,
-                    lambda player_id: player_name_lookup[player_id],
+                    lambda player_key: player_name_lookup[player_key],
                 )
 
                 if default_player is None:
@@ -3982,28 +4226,28 @@ with players_tab:
                 search_placeholder="Filter players",
             )
 
-        selected_player_ids = [
-            player_id
-            for player_id in [
+        selected_player_keys = [
+            player_key
+            for player_key in [
                 selected_player_1,
                 selected_player_2,
                 selected_player_3,
                 selected_player_4,
             ]
-            if player_id is not None
+            if player_key is not None
         ]
 
         # Keep dropdown order, but prevent the same player appearing twice.
-        unique_player_ids = []
+        unique_player_keys = []
         duplicate_found = False
 
-        for player_id in selected_player_ids:
-            if player_id not in unique_player_ids:
-                unique_player_ids.append(player_id)
+        for player_key in selected_player_keys:
+            if player_key not in unique_player_keys:
+                unique_player_keys.append(player_key)
             else:
                 duplicate_found = True
 
-        selected_player_ids = unique_player_ids
+        selected_player_keys = unique_player_keys
 
         if duplicate_found:
             st.warning(
@@ -4011,24 +4255,24 @@ with players_tab:
                 "Duplicate selections have been ignored."
             )
 
-        if not selected_player_ids:
+        if not selected_player_keys:
             st.info(
-                "Choose one to four players to compare their profile and "
-                "tournament event data."
+                "Choose one to four players to compare detailed tournament "
+                "statistics and career international records."
             )
 
         else:
-            # reindex keeps the players in Player 1 → Player 4 order.
+            # Reindex keeps Player 1 → Player 4 order.
             selected_players = (
-                available_players.set_index("player_id")
-                .reindex(selected_player_ids)
+                available_players.set_index("player_key")
+                .reindex(selected_player_keys)
                 .reset_index()
                 .copy()
             )
 
             # Use concise two-line labels inside charts so four selected
             # players remain readable in a two-column dashboard layout.
-            # Full names remain available in hover tooltips and the tables.
+            # Full names remain available in hover tooltips and tables.
             name_particles = {
                 "al",
                 "bin",
@@ -4087,245 +4331,52 @@ with players_tab:
             ]
 
             # -----------------------------------------------------------------
-            # Compact comparison table
+            # Attacking charts
             # -----------------------------------------------------------------
             st.markdown(
-                '<div class="section-label">Profile and event comparison</div>',
+                '<div class="section-label">Attacking contribution</div>',
                 unsafe_allow_html=True,
             )
 
-            comparison_table = selected_players[
-                [
-                    "player_name",
-                    "team_name",
-                    "position",
-                    "club_team",
-                    "caps",
-                    "goals",
-                    "goals_per_cap",
-                    "tournament_goals",
-                    "yellow_cards",
-                    "red_cards",
-                ]
-            ].rename(
-                columns={
-                    "player_name": "Player",
-                    "team_name": "Team",
-                    "position": "Position",
-                    "club_team": "Club",
-                    "caps": "International caps",
-                    "goals": "Career international goals",
-                    "goals_per_cap": "Goals per cap",
-                    "tournament_goals": "Tournament goals",
-                    "yellow_cards": "YC",
-                    "red_cards": "RC",
-                }
-            )
-
-            themed_dataframe(
-                comparison_table,
-                width="stretch",
-                hide_index=True,
-                height=180,
-                column_config={
-                    "Player": st.column_config.TextColumn(
-                        "Player",
-                        width="medium",
-                    ),
-                    "Team": st.column_config.TextColumn(
-                        "Team",
-                        width="medium",
-                    ),
-                    "Position": st.column_config.TextColumn(
-                        "Position",
-                        width="small",
-                    ),
-                    "Club": st.column_config.TextColumn(
-                        "Club",
-                        width="medium",
-                    ),
-                    "International caps": st.column_config.NumberColumn(
-                        "Caps",
-                        format="%d",
-                    ),
-                    "Career international goals": st.column_config.NumberColumn(
-                        "Career goals",
-                        format="%d",
-                    ),
-                    "Goals per cap": st.column_config.NumberColumn(
-                        "G/Cap",
-                        format="%.2f",
-                    ),
-                    "Tournament goals": st.column_config.NumberColumn(
-                        "Tournament goals",
-                        format="%d",
-                    ),
-                    "YC": st.column_config.NumberColumn(
-                        "YC",
-                        format="%d",
-                    ),
-                    "RC": st.column_config.NumberColumn(
-                        "RC",
-                        format="%d",
-                    ),
-                },
-            )
-
-            # Secondary information is useful, but does not need to dominate
-            # the main comparison view.
-            with st.expander("View secondary player details"):
-                secondary_details = selected_players[
-                    [
-                        "player_name",
-                        "height_cm",
-                        "market_value_millions",
-                        "goal_minutes",
-                    ]
-                ].rename(
-                    columns={
-                        "player_name": "Player",
-                        "height_cm": "Height (cm)",
-                        "market_value_millions": "Market value (€m)",
-                        "goal_minutes": "Tournament goal minutes",
-                    }
-                )
-
-                themed_dataframe(
-                    secondary_details,
-                    width="stretch",
-                    hide_index=True,
-                    height=180,
-                    column_config={
-                        "Height (cm)": st.column_config.NumberColumn(
-                            "Height (cm)",
-                            format="%d",
-                        ),
-                        "Market value (€m)": st.column_config.NumberColumn(
-                            "Market value (€m)",
-                            format="€%.1f m",
-                        ),
-                    },
-                )
-
-            # -----------------------------------------------------------------
-            # Player comparison charts
-            #
-            # Horizontal bars are intentional: player names and teams remain
-            # legible at any dashboard width, rather than colliding on a
-            # crowded x-axis. All four figures use the same height and axis
-            # treatment so their chart cards align cleanly.
-            # -----------------------------------------------------------------
-            st.markdown(
-                '<div class="section-label">Tournament event record</div>',
-                unsafe_allow_html=True,
-            )
-
-            goals_chart_column, discipline_chart_column = st.columns(
+            attacking_chart_column, shooting_chart_column = st.columns(
                 2,
                 gap="large",
             )
 
-            with goals_chart_column:
-                st.subheader("Tournament goals")
+            with attacking_chart_column:
+                st.subheader("Goals and assists")
 
-                tournament_goals_figure = px.bar(
-                    selected_players,
-                    x="tournament_goals",
-                    y="chart_label",
-                    orientation="h",
-                    color="chart_label",
-                    color_discrete_map=colour_map,
-                    custom_data=["player_name", "team_name"],
-                    labels={
-                        "chart_label": "Player",
-                        "tournament_goals": "Goals",
-                    },
-                )
-
-                tournament_goals_figure = style_chart(
-                    tournament_goals_figure,
-                    theme,
-                )
-
-                tournament_goals_figure.update_traces(
-                    hovertemplate=(
-                        "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
-                        "Tournament goals: %{x}"
-                        "<extra></extra>"
-                    ),
-                )
-
-                tournament_goals_figure.update_layout(
-                    height=420,
-                    showlegend=False,
-                    margin={"l": 18, "r": 46, "t": 24, "b": 24},
-                )
-
-                tournament_goals_figure.update_xaxes(
-                    title="Goals",
-                    rangemode="tozero",
-                    dtick=1,
-                    automargin=True,
-                )
-
-                tournament_goals_figure.update_yaxes(
-                    title=None,
-                    autorange="reversed",
-                    tickfont={"size": 12, "color": theme["text"]},
-                    automargin=True,
-                )
-
-                st.plotly_chart(
-                    tournament_goals_figure,
-                    width="stretch",
-                    config={"displayModeBar": False},
-                )
-
-            with discipline_chart_column:
-                st.subheader("Tournament discipline")
-
-                discipline_data = selected_players.melt(
+                attacking_data = selected_players.melt(
                     id_vars=["chart_label", "player_name", "team_name"],
-                    value_vars=[
-                        "yellow_cards",
-                        "red_cards",
-                    ],
-                    var_name="Card type",
-                    value_name="Cards",
+                    value_vars=["goals", "assists"],
+                    var_name="Metric",
+                    value_name="Value",
                 )
 
-                discipline_data["Card type"] = discipline_data[
-                    "Card type"
-                ].replace(
+                attacking_data["Metric"] = attacking_data["Metric"].replace(
                     {
-                        "yellow_cards": "Yellow cards",
-                        "red_cards": "Red cards",
+                        "goals": "Goals",
+                        "assists": "Assists",
                     }
                 )
 
-                discipline_figure = px.bar(
-                    discipline_data,
-                    x="Cards",
+                attacking_figure = px.bar(
+                    attacking_data,
+                    x="Value",
                     y="chart_label",
                     orientation="h",
-                    color="Card type",
+                    color="Metric",
                     barmode="group",
                     custom_data=["player_name", "team_name"],
                     color_discrete_map={
-                        "Yellow cards": "#d7a600",
-                        "Red cards": "#c93c3c",
-                    },
-                    labels={
-                        "chart_label": "Player",
+                        "Goals": theme["comparison_team_a"],
+                        "Assists": theme["comparison_team_b"],
                     },
                 )
 
-                discipline_figure = style_chart(
-                    discipline_figure,
-                    theme,
-                )
+                attacking_figure = style_chart(attacking_figure, theme)
 
-                discipline_figure.update_traces(
+                attacking_figure.update_traces(
                     hovertemplate=(
                         "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
                         "%{fullData.name}: %{x}"
@@ -4333,7 +4384,7 @@ with players_tab:
                     ),
                 )
 
-                discipline_figure.update_layout(
+                attacking_figure.update_layout(
                     height=420,
                     showlegend=True,
                     legend={
@@ -4346,14 +4397,14 @@ with players_tab:
                     margin={"l": 18, "r": 46, "t": 48, "b": 24},
                 )
 
-                discipline_figure.update_xaxes(
-                    title="Cards",
+                attacking_figure.update_xaxes(
+                    title="Tournament total",
                     rangemode="tozero",
                     dtick=1,
                     automargin=True,
                 )
 
-                discipline_figure.update_yaxes(
+                attacking_figure.update_yaxes(
                     title=None,
                     autorange="reversed",
                     tickfont={"size": 12, "color": theme["text"]},
@@ -4361,10 +4412,585 @@ with players_tab:
                 )
 
                 st.plotly_chart(
-                    discipline_figure,
+                    attacking_figure,
                     width="stretch",
                     config={"displayModeBar": False},
                 )
+
+            with shooting_chart_column:
+                st.subheader("Shooting volume")
+
+                shooting_data = selected_players.melt(
+                    id_vars=["chart_label", "player_name", "team_name"],
+                    value_vars=["shots", "shots_on_target"],
+                    var_name="Metric",
+                    value_name="Value",
+                )
+
+                shooting_data["Metric"] = shooting_data["Metric"].replace(
+                    {
+                        "shots": "Shots",
+                        "shots_on_target": "Shots on target",
+                    }
+                )
+
+                shooting_figure = px.bar(
+                    shooting_data,
+                    x="Value",
+                    y="chart_label",
+                    orientation="h",
+                    color="Metric",
+                    barmode="group",
+                    custom_data=["player_name", "team_name"],
+                    color_discrete_map={
+                        "Shots": theme["comparison_team_b"],
+                        "Shots on target": theme["comparison_team_a"],
+                    },
+                )
+
+                shooting_figure = style_chart(shooting_figure, theme)
+
+                shooting_figure.update_traces(
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
+                        "%{fullData.name}: %{x}"
+                        "<extra></extra>"
+                    ),
+                )
+
+                shooting_figure.update_layout(
+                    height=420,
+                    showlegend=True,
+                    legend={
+                        "orientation": "h",
+                        "yanchor": "bottom",
+                        "y": 1.02,
+                        "xanchor": "right",
+                        "x": 1,
+                    },
+                    margin={"l": 18, "r": 46, "t": 48, "b": 24},
+                )
+
+                shooting_figure.update_xaxes(
+                    title="Tournament total",
+                    rangemode="tozero",
+                    dtick=1,
+                    automargin=True,
+                )
+
+                shooting_figure.update_yaxes(
+                    title=None,
+                    autorange="reversed",
+                    tickfont={"size": 12, "color": theme["text"]},
+                    automargin=True,
+                )
+
+                st.plotly_chart(
+                    shooting_figure,
+                    width="stretch",
+                    config={"displayModeBar": False},
+                )
+
+            # -----------------------------------------------------------------
+            # Playing time and defensive contribution
+            # -----------------------------------------------------------------
+            st.markdown(
+                '<div class="section-label">Playing time and contribution</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Keep the metric control on its own row so both charts begin at
+            # the same height. The selected metric can now cover attacking,
+            # availability, defensive and on-pitch impact statistics.
+            metric_options = {
+                "Goal contributions": {
+                    "column": "goals_assists",
+                    "axis_title": "Goal contributions",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Goal contributions per 90": {
+                    "column": "goals_assists_per90",
+                    "axis_title": "Goal contributions per 90",
+                    "hover_value": "%{x:.2f}",
+                    "tickformat": ".1f",
+                    "is_rate": True,
+                },
+                "Non-penalty goals": {
+                    "column": "goals_pens",
+                    "axis_title": "Non-penalty goals",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Shots on target %": {
+                    "column": "shots_on_target_pct",
+                    "axis_title": "Shots on target (%)",
+                    "hover_value": "%{x:.1f}%",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Shots per 90": {
+                    "column": "shots_per90",
+                    "axis_title": "Shots per 90",
+                    "hover_value": "%{x:.2f}",
+                    "tickformat": ".1f",
+                    "is_rate": True,
+                },
+                "Minutes played": {
+                    "column": "minutes",
+                    "axis_title": "Minutes played",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Minutes %": {
+                    "column": "minutes_pct",
+                    "axis_title": "Minutes played (%)",
+                    "hover_value": "%{x:.1f}%",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Interceptions": {
+                    "column": "interceptions",
+                    "axis_title": "Interceptions",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Tackles won": {
+                    "column": "tackles_won",
+                    "axis_title": "Tackles won",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Fouls won": {
+                    "column": "fouled",
+                    "axis_title": "Fouls won",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Fouls committed": {
+                    "column": "fouls",
+                    "axis_title": "Fouls committed",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Crosses": {
+                    "column": "crosses",
+                    "axis_title": "Crosses",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Offsides": {
+                    "column": "offsides",
+                    "axis_title": "Offsides",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Yellow cards": {
+                    "column": "cards_yellow",
+                    "axis_title": "Yellow cards",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "Red cards": {
+                    "column": "cards_red",
+                    "axis_title": "Red cards",
+                    "hover_value": "%{x:.0f}",
+                    "tickformat": ".0f",
+                    "is_rate": False,
+                },
+                "On-pitch goal difference per 90": {
+                    "column": "plus_minus_per90",
+                    "axis_title": "On-pitch goal difference per 90",
+                    "hover_value": "%{x:+.2f}",
+                    "tickformat": "+.1f",
+                    "is_rate": True,
+                },
+            }
+
+            metric_control_spacer, metric_control_column = st.columns(
+                2,
+                gap="large",
+            )
+
+            with metric_control_column:
+                selected_metric_label = themed_selectbox(
+                    "Comparison metric",
+                    list(metric_options),
+                    key="player_detail_metric",
+                    search_placeholder="Filter metrics",
+                )
+
+            selected_metric_definition = metric_options[
+                selected_metric_label
+            ]
+            selected_metric = selected_metric_definition["column"]
+
+            playing_time_column, defensive_column = st.columns(
+                2,
+                gap="large",
+            )
+
+            with playing_time_column:
+                st.subheader("Minutes and starts")
+
+                minutes_figure = go.Figure()
+
+                minutes_figure.add_trace(
+                    go.Bar(
+                        x=selected_players["minutes"],
+                        y=selected_players["chart_label"],
+                        orientation="h",
+                        name="Minutes played",
+                        marker_color=selected_player_colours,
+                        customdata=selected_players[
+                            [
+                                "player_name",
+                                "team_name",
+                                "games",
+                                "games_complete",
+                            ]
+                        ].to_numpy(),
+                        hovertemplate=(
+                            "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
+                            "Minutes: %{x:.0f}<br>"
+                            "Appearances: %{customdata[2]:.0f}<br>"
+                            "Complete games: %{customdata[3]:.0f}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+                minutes_figure.add_trace(
+                    go.Scatter(
+                        x=selected_players["games_starts"],
+                        y=selected_players["chart_label"],
+                        name="Starts",
+                        xaxis="x2",
+                        # Keep the number inside a compact coloured badge.
+                        # The fill matches the player bar, while the white ring
+                        # and white type make the value readable at a glance.
+                        mode="markers+text",
+                        text=[
+                            f"{value:.0f}"
+                            for value in selected_players["games_starts"]
+                        ],
+                        textposition="middle center",
+                        marker={
+                            "size": 30,
+                            "symbol": "circle",
+                            "color": selected_player_colours,
+                            "line": {
+                                "color": theme["card_bg"],
+                                "width": 3,
+                            },
+                        },
+                        textfont={
+                            "color": theme["card_bg"],
+                            "size": 12,
+                            "family": "Arial Black, Arial, sans-serif",
+                        },
+                        cliponaxis=False,
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            "Starts: %{x:.0f}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+                minutes_figure = style_chart(minutes_figure, theme)
+
+                maximum_starts = max(
+                    float(selected_players["games_starts"].max()),
+                    1.0,
+                )
+
+                minutes_figure.update_layout(
+                    height=420,
+                    showlegend=True,
+                    legend={
+                        "orientation": "h",
+                        "yanchor": "bottom",
+                        "y": 1.02,
+                        "xanchor": "right",
+                        "x": 1,
+                    },
+                    margin={"l": 18, "r": 52, "t": 48, "b": 24},
+                    xaxis={
+                        "title": "Minutes played",
+                        "rangemode": "tozero",
+                        "automargin": True,
+                    },
+                    xaxis2={
+                        "title": "Starts",
+                        "overlaying": "x",
+                        "side": "top",
+                        # Extra room keeps badges visible at zero and max.
+                        "range": [
+                            -maximum_starts * 0.08,
+                            maximum_starts * 2,
+                        ],
+                        "showgrid": False,
+                        "dtick": 1,
+                        "tickfont": {"color": theme["muted"]},
+                        "title_font": {"color": theme["muted"]},
+                    },
+                    yaxis={
+                        "title": None,
+                        "autorange": "reversed",
+                        "tickfont": {
+                            "size": 12,
+                            "color": theme["text"],
+                        },
+                        "automargin": True,
+                    },
+                )
+
+                st.plotly_chart(
+                    minutes_figure,
+                    width="stretch",
+                    config={"displayModeBar": False},
+                )
+
+            with defensive_column:
+                st.subheader(selected_metric_label)
+
+                defensive_figure = px.bar(
+                    selected_players,
+                    x=selected_metric,
+                    y="chart_label",
+                    orientation="h",
+                    color="chart_label",
+                    color_discrete_map=colour_map,
+                    custom_data=["player_name", "team_name"],
+                    labels={
+                        "chart_label": "Player",
+                        selected_metric: selected_metric_definition[
+                            "axis_title"
+                        ],
+                    },
+                )
+
+                defensive_figure = style_chart(defensive_figure, theme)
+
+                defensive_figure.update_traces(
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
+                        f"{selected_metric_definition['axis_title']}: "
+                        f"{selected_metric_definition['hover_value']}"
+                        "<extra></extra>"
+                    ),
+                )
+
+                defensive_figure.update_layout(
+                    height=420,
+                    showlegend=False,
+                    margin={"l": 18, "r": 46, "t": 24, "b": 24},
+                )
+
+                defensive_figure.update_xaxes(
+                    title=selected_metric_definition["axis_title"],
+                    rangemode="tozero",
+                    tickformat=selected_metric_definition["tickformat"],
+                    automargin=True,
+                )
+
+                defensive_figure.update_yaxes(
+                    title=None,
+                    autorange="reversed",
+                    tickfont={"size": 12, "color": theme["text"]},
+                    automargin=True,
+                )
+
+                if selected_metric == "plus_minus_per90":
+                    defensive_figure.add_vline(
+                        x=0,
+                        line_color=theme["muted"],
+                        line_width=1,
+                    )
+
+                st.plotly_chart(
+                    defensive_figure,
+                    width="stretch",
+                    config={"displayModeBar": False},
+                )
+
+            if selected_metric_definition["is_rate"]:
+                st.caption(
+                    "Per-90 metrics should be interpreted alongside minutes "
+                    "played, as short appearances can produce extreme values."
+                )
+
+            # -----------------------------------------------------------------
+            # Goalkeeping is shown only when the selection contains a keeper
+            # with recorded goalkeeper minutes.
+            # -----------------------------------------------------------------
+            if selected_players["gk_minutes"].gt(0).any():
+                st.markdown(
+                    '<div class="section-label">Goalkeeping</div>',
+                    unsafe_allow_html=True,
+                )
+
+                goalkeeper_chart_column, goalkeeper_rate_column = st.columns(
+                    2,
+                    gap="large",
+                )
+
+                with goalkeeper_chart_column:
+                    st.subheader("Saves and clean sheets")
+
+                    goalkeeper_data = selected_players.melt(
+                        id_vars=[
+                            "chart_label",
+                            "player_name",
+                            "team_name",
+                        ],
+                        value_vars=["gk_saves", "gk_clean_sheets"],
+                        var_name="Metric",
+                        value_name="Value",
+                    )
+
+                    goalkeeper_data["Metric"] = goalkeeper_data[
+                        "Metric"
+                    ].replace(
+                        {
+                            "gk_saves": "Saves",
+                            "gk_clean_sheets": "Clean sheets",
+                        }
+                    )
+
+                    goalkeeper_figure = px.bar(
+                        goalkeeper_data,
+                        x="Value",
+                        y="chart_label",
+                        orientation="h",
+                        color="Metric",
+                        barmode="group",
+                        custom_data=["player_name", "team_name"],
+                        color_discrete_map={
+                            "Saves": theme["comparison_team_b"],
+                            "Clean sheets": theme["comparison_team_a"],
+                        },
+                    )
+
+                    goalkeeper_figure = style_chart(
+                        goalkeeper_figure,
+                        theme,
+                    )
+
+                    goalkeeper_figure.update_traces(
+                        hovertemplate=(
+                            "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
+                            "%{fullData.name}: %{x}"
+                            "<extra></extra>"
+                        ),
+                    )
+
+                    goalkeeper_figure.update_layout(
+                        height=420,
+                        showlegend=True,
+                        legend={
+                            "orientation": "h",
+                            "yanchor": "bottom",
+                            "y": 1.02,
+                            "xanchor": "right",
+                            "x": 1,
+                        },
+                        margin={"l": 18, "r": 46, "t": 48, "b": 24},
+                    )
+
+                    goalkeeper_figure.update_xaxes(
+                        title="Tournament total",
+                        rangemode="tozero",
+                        dtick=1,
+                        automargin=True,
+                    )
+
+                    goalkeeper_figure.update_yaxes(
+                        title=None,
+                        autorange="reversed",
+                        tickfont={"size": 12, "color": theme["text"]},
+                        automargin=True,
+                    )
+
+                    st.plotly_chart(
+                        goalkeeper_figure,
+                        width="stretch",
+                        config={"displayModeBar": False},
+                    )
+
+                with goalkeeper_rate_column:
+                    st.subheader("Save percentage")
+
+                    save_percentage_figure = px.bar(
+                        selected_players,
+                        x="gk_save_pct",
+                        y="chart_label",
+                        orientation="h",
+                        color="chart_label",
+                        color_discrete_map=colour_map,
+                        custom_data=[
+                            "player_name",
+                            "team_name",
+                            "gk_minutes",
+                            "gk_goals_against",
+                        ],
+                        labels={
+                            "chart_label": "Player",
+                            "gk_save_pct": "Save percentage",
+                        },
+                    )
+
+                    save_percentage_figure = style_chart(
+                        save_percentage_figure,
+                        theme,
+                    )
+
+                    save_percentage_figure.update_traces(
+                        hovertemplate=(
+                            "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
+                            "Save percentage: %{x:.1f}%<br>"
+                            "Goalkeeper minutes: %{customdata[2]:.0f}<br>"
+                            "Goals conceded: %{customdata[3]:.0f}"
+                            "<extra></extra>"
+                        ),
+                    )
+
+                    save_percentage_figure.update_layout(
+                        height=420,
+                        showlegend=False,
+                        margin={"l": 18, "r": 46, "t": 24, "b": 24},
+                    )
+
+                    save_percentage_figure.update_xaxes(
+                        title="Save percentage",
+                        range=[0, 100],
+                        ticksuffix="%",
+                        automargin=True,
+                    )
+
+                    save_percentage_figure.update_yaxes(
+                        title=None,
+                        autorange="reversed",
+                        tickfont={"size": 12, "color": theme["text"]},
+                        automargin=True,
+                    )
+
+                    st.plotly_chart(
+                        save_percentage_figure,
+                        width="stretch",
+                        config={"displayModeBar": False},
+                    )
 
             # -----------------------------------------------------------------
             # International record charts
@@ -4380,15 +5006,13 @@ with players_tab:
             )
 
             with caps_chart_column:
-                # Kept compact so this heading remains a single line and the
-                # chart starts level with the chart beside it.
-                st.subheader("Caps & goals/cap")
+                st.subheader("Caps and goals per cap")
 
                 caps_figure = go.Figure()
 
                 caps_figure.add_trace(
                     go.Bar(
-                        x=selected_players["caps"],
+                        x=selected_players["career_caps"].fillna(0),
                         y=selected_players["chart_label"],
                         orientation="h",
                         name="International caps",
@@ -4402,7 +5026,7 @@ with players_tab:
                         ].to_numpy(),
                         hovertemplate=(
                             "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
-                            "International caps: %{x}<br>"
+                            "International caps: %{x:.0f}<br>"
                             "Goals per cap: %{customdata[2]:.2f}"
                             "<extra></extra>"
                         ),
@@ -4415,20 +5039,29 @@ with players_tab:
                         y=selected_players["chart_label"],
                         name="Goals per cap",
                         xaxis="x2",
+                        # Keep the decimal value inside a colour-matched
+                        # badge, rather than separating the dot and the text.
                         mode="markers+text",
                         text=[
                             f"{value:.2f}"
                             for value in selected_players["goals_per_cap"]
                         ],
-                        textposition="middle right",
+                        textposition="middle center",
                         marker={
-                            "size": 11,
+                            "size": 38,
+                            "symbol": "circle",
                             "color": selected_player_colours,
                             "line": {
-                                "color": theme["text"],
-                                "width": 1,
+                                "color": theme["card_bg"],
+                                "width": 3,
                             },
                         },
+                        textfont={
+                            "color": theme["card_bg"],
+                            "size": 10,
+                            "family": "Arial Black, Arial, sans-serif",
+                        },
+                        cliponaxis=False,
                         hovertemplate=(
                             "<b>%{y}</b><br>"
                             "Goals per cap: %{x:.2f}"
@@ -4437,10 +5070,7 @@ with players_tab:
                     )
                 )
 
-                caps_figure = style_chart(
-                    caps_figure,
-                    theme,
-                )
+                caps_figure = style_chart(caps_figure, theme)
 
                 max_goals_per_cap = max(
                     float(selected_players["goals_per_cap"].max()),
@@ -4467,7 +5097,11 @@ with players_tab:
                         "title": "Goals per cap",
                         "overlaying": "x",
                         "side": "top",
-                        "range": [0, max_goals_per_cap * 1.22],
+                        # Extra room keeps badges visible at zero and max.
+                        "range": [
+                            -max_goals_per_cap * 0.08,
+                            max_goals_per_cap * 1.35,
+                        ],
                         "showgrid": False,
                         "tickformat": ".1f",
                         "tickfont": {"color": theme["muted"]},
@@ -4495,7 +5129,7 @@ with players_tab:
 
                 career_goals_figure = px.bar(
                     selected_players,
-                    x="goals",
+                    x="career_international_goals",
                     y="chart_label",
                     orientation="h",
                     color="chart_label",
@@ -4503,7 +5137,8 @@ with players_tab:
                     custom_data=["player_name", "team_name"],
                     labels={
                         "chart_label": "Player",
-                        "goals": "Career international goals",
+                        "career_international_goals":
+                            "Career international goals",
                     },
                 )
 
@@ -4515,7 +5150,7 @@ with players_tab:
                 career_goals_figure.update_traces(
                     hovertemplate=(
                         "<b>%{customdata[0]}</b> — %{customdata[1]}<br>"
-                        "Career international goals: %{x}"
+                        "Career international goals: %{x:.0f}"
                         "<extra></extra>"
                     ),
                 )
@@ -4546,102 +5181,6 @@ with players_tab:
                     config={"displayModeBar": False},
                 )
 
-            # -----------------------------------------------------------------
-            # Expandable event log
-            # -----------------------------------------------------------------
-            with st.expander("View recorded tournament events"):
-                selected_event_log = match_events.loc[
-                    match_events["match_id"].isin(active_match_ids)
-                    & match_events["player_id"].isin(selected_player_ids)
-                    & match_events["event_type"].isin(
-                        [
-                            "Goal",
-                            "Yellow Card",
-                            "Red Card",
-                        ]
-                    )
-                ].copy()
-
-                selected_event_log = selected_event_log.merge(
-                    selected_players[
-                        [
-                            "player_id",
-                            "player_name",
-                        ]
-                    ],
-                    on="player_id",
-                    how="left",
-                )
-
-                selected_event_log = selected_event_log.merge(
-                    filtered_matches[
-                        [
-                            "match_id",
-                            "kickoff_uk",
-                            "home_team_name",
-                            "away_team_name",
-                        ]
-                    ],
-                    on="match_id",
-                    how="left",
-                )
-
-                if selected_event_log.empty:
-                    st.info(
-                        "No goal or card events were recorded for the selected "
-                        "players within the current fixture filters. This does "
-                        "not mean that they did not play."
-                    )
-
-                else:
-                    selected_event_log["fixture"] = (
-                        selected_event_log["home_team_name"]
-                        + " v "
-                        + selected_event_log["away_team_name"]
-                    )
-
-                    selected_event_log = selected_event_log.sort_values(
-                        [
-                            "kickoff_uk",
-                            "minute",
-                        ]
-                    )
-
-                    selected_event_log["date"] = (
-                        selected_event_log["kickoff_uk"].dt.strftime(
-                            "%a %d %b"
-                        )
-                    )
-
-                    selected_event_log["minute"] = (
-                        selected_event_log["minute"]
-                        .astype(int)
-                        .astype(str)
-                        + "'"
-                    )
-
-                    themed_dataframe(
-                        selected_event_log[
-                            [
-                                "player_name",
-                                "event_type",
-                                "minute",
-                                "date",
-                                "fixture",
-                            ]
-                        ].rename(
-                            columns={
-                                "player_name": "Player",
-                                "event_type": "Event",
-                                "minute": "Minute",
-                                "date": "Date",
-                                "fixture": "Fixture",
-                            }
-                        ),
-                        width="stretch",
-                        hide_index=True,
-                        height=280,
-                    )
 
 # -----------------------------------------------------------------------------
 # Venues tab
