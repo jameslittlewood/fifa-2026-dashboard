@@ -854,25 +854,64 @@ def inject_theme_css(active_theme: dict[str, str]) -> None:
             }}
 
 
-            /* Hide the Streamlit header, toolbar, menu, and footer. */
+            /*
+             * Keep the Streamlit header in the page. When the sidebar is
+             * collapsed, Streamlit places its reopen button inside this header.
+             * Hiding the header removes that button and makes filters impossible
+             * to bring back on a narrow or embedded live dashboard.
+             */
             header[data-testid="stHeader"] {{
-                display: none !important;
+                background: var(--app-bg) !important;
+                display: block !important;
+                z-index: 999998 !important;
             }}
 
-            div[data-testid="stToolbar"] {{
-                display: none !important;
-            }}
-
-            div[data-testid="stDecoration"] {{
-                display: none !important;
-            }}
-
+            /* Hide the Streamlit chrome, but never the sidebar reopen control. */
+            [data-testid="stToolbar"],
+            [data-testid="stDecoration"],
             #MainMenu,
             footer {{
                 display: none !important;
             }}
 
-            /* Remove the blank space left above the dashboard. */
+            /*
+             * Streamlit has used both selectors across releases. Keep either
+             * version visible and clickable whenever the sidebar is collapsed.
+             */
+            [data-testid="stSidebarCollapsedControl"],
+            [data-testid="stExpandSidebarButton"],
+            header[data-testid="stHeader"] button[kind="headerNoPadding"] {{
+                display: flex !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                pointer-events: auto !important;
+                position: fixed !important;
+                top: 0.55rem !important;
+                left: 0.55rem !important;
+                z-index: 999999 !important;
+                background: var(--card-bg) !important;
+                color: var(--text) !important;
+                border: 1px solid var(--border) !important;
+                border-radius: 10px !important;
+                box-shadow: var(--shadow) !important;
+            }}
+
+            [data-testid="stSidebarCollapsedControl"] svg,
+            [data-testid="stExpandSidebarButton"] svg,
+            header[data-testid="stHeader"] button[kind="headerNoPadding"] svg {{
+                color: var(--accent) !important;
+                fill: currentColor !important;
+            }}
+
+            /* Do not show a duplicate reopen button while the sidebar is open. */
+            .stApp:has([data-testid="stSidebar"][aria-expanded="true"])
+            [data-testid="stSidebarCollapsedControl"],
+            .stApp:has([data-testid="stSidebar"][aria-expanded="true"])
+            [data-testid="stExpandSidebarButton"] {{
+                display: none !important;
+            }}
+
+            /* Keep the compact top spacing from the original dashboard. */
             section.main > div.block-container {{
                 padding-top: 1rem !important;
             }}
